@@ -1,0 +1,7 @@
+{
+  "name": "Proteforms",
+  "description": "Gestão inteligente de inspeções técnicas, relatórios de obras e conformidade normativa com registro fotográfico.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
