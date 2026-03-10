@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Proteforms</string>
+    <string name="title_activity_main">Proteforms</string>
+    <string name="package_name">com.proteforms.app</string>
+    <string name="custom_url_scheme">com.proteforms.app</string>
+</resources>

@@ -1,0 +1,17 @@
+{
+  "name": "Proteforms",
+  "short_name": "Proteforms",
+  "description": "Gestão de Inspeções Técnicas",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0D4E5E",
+  "theme_color": "#0D4E5E",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

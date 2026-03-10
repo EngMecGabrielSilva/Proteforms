@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import * as React from 'react';
+import { useState, useEffect, Component, ReactNode, ErrorInfo } from 'react';
 import { 
   LayoutDashboard, 
   HardHat, 
@@ -29,7 +30,10 @@ import {
   Database,
   Cloud,
   Lock,
-  LogOut
+  LogOut,
+  Eye,
+  EyeOff,
+  Loader
 } from 'lucide-react';
 import { 
   BarChart, 
@@ -52,10 +56,95 @@ import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { Document, Packer, Paragraph, TextRun, ImageRun, Table, TableRow, TableCell, WidthType, AlignmentType, HeadingLevel, VerticalAlign, TableBorders } from 'docx';
 import { saveAs } from 'file-saver';
-import { cn, apiFetch } from './utils';
+import { Capacitor } from '@capacitor/core';
+import { Camera as CapCamera, CameraResultType, CameraSource } from '@capacitor/camera';
+import { supabase } from './supabaseClient';
+import { cn } from './utils';
 import { Construction, Report, CompanySettings, ReportPhoto, ReportChecklistItem, ChecklistTemplate } from './types';
 
+// --- Utilities ---
+
+const fetchWithTimeout = async (promise: any, timeoutMs: number = 10000) => {
+  const timeout = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error("Request timeout")), timeoutMs)
+  );
+  return Promise.race([Promise.resolve(promise), timeout]);
+};
+
 // --- Components ---
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends Component<any, any> {
+  public state = { hasError: false, error: null as Error | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+          <div className="bg-white p-8 rounded-[32px] shadow-xl max-w-md w-full text-center space-y-4">
+            <div className="w-16 h-16 bg-rose-50 text-rose-600 rounded-2xl flex items-center justify-center mx-auto">
+              <AlertCircle size={32} />
+            </div>
+            <h1 className="text-xl font-bold text-slate-900">Algo deu errado</h1>
+            <p className="text-sm text-slate-600">
+              {this.state.error?.message || "Ocorreu um erro inesperado na aplicação."}
+            </p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full py-4 bg-brand-blue text-white rounded-xl font-bold"
+            >
+              TENTAR NOVAMENTE
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return (this as any).props.children;
+  }
+}
+
+const LoadingScreen = () => (
+  <div className="flex flex-col items-center justify-center p-12 space-y-4">
+    <motion.div
+      animate={{ rotate: 360 }}
+      transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+      className="text-brand-teal"
+    >
+      <Loader size={40} />
+    </motion.div>
+    <p className="text-slate-500 font-medium animate-pulse">Carregando informações...</p>
+  </div>
+);
+
+const LoadingOverlay = () => (
+  <div className="fixed inset-0 bg-white/60 backdrop-blur-[2px] z-[9999] flex flex-col items-center justify-center space-y-4">
+    <motion.div
+      animate={{ rotate: 360 }}
+      transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+      className="text-brand-teal"
+    >
+      <Loader size={48} />
+    </motion.div>
+    <p className="text-slate-900 font-bold">Aguarde um momento...</p>
+  </div>
+);
 
 const ConfirmationModal = ({ 
   isOpen, 
@@ -177,25 +266,68 @@ const VoiceButton = ({ onResult, showToast }: { onResult: (text: string) => void
 
   const startListening = () => {
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+    
+    console.log('[Voice] Checking SpeechRecognition support...');
     if (!SpeechRecognition) {
+      console.error('[Voice] SpeechRecognition not supported in this browser/WebView.');
       if (showToast) showToast('Seu navegador não suporta reconhecimento de voz.', 'error');
-      else alert('Seu navegador não suporta reconhecimento de voz.');
       return;
     }
 
     const recognition = new SpeechRecognition();
     recognition.lang = 'pt-BR';
-    recognition.onstart = () => setIsListening(true);
-    recognition.onend = () => setIsListening(false);
-    recognition.onerror = () => {
-      if (showToast) showToast('Erro no reconhecimento de voz.', 'error');
+    recognition.continuous = false;
+    recognition.interimResults = false;
+
+    recognition.onstart = () => {
+      console.log('[Voice] Started listening...');
+      setIsListening(true);
+    };
+
+    recognition.onend = () => {
+      console.log('[Voice] Stopped listening.');
       setIsListening(false);
     };
+
+    recognition.onerror = (event: any) => {
+      console.error('[Voice] Error occurred:', event.error, event.message || '');
+      
+      let errorMsg = 'Erro no reconhecimento de voz.';
+      
+      switch (event.error) {
+        case 'not-allowed':
+        case 'permission-denied':
+          errorMsg = 'Permissão de microfone negada. Verifique as configurações do app.';
+          break;
+        case 'no-speech':
+          errorMsg = 'Nenhuma fala detectada.';
+          break;
+        case 'audio-capture':
+          errorMsg = 'Microfone indisponível ou não encontrado.';
+          break;
+        case 'network':
+          errorMsg = 'Erro de rede no reconhecimento de voz.';
+          break;
+        default:
+          errorMsg = `Erro: ${event.error}`;
+      }
+      
+      if (showToast) showToast(errorMsg, 'error');
+      setIsListening(false);
+    };
+
     recognition.onresult = (event: any) => {
       const transcript = event.results[0][0].transcript;
+      console.log('[Voice] Result received:', transcript);
       onResult(transcript);
     };
-    recognition.start();
+
+    try {
+      recognition.start();
+    } catch (err) {
+      console.error('[Voice] Failed to start recognition:', err);
+      if (showToast) showToast('Falha ao iniciar microfone.', 'error');
+    }
   };
 
   return (
@@ -215,39 +347,81 @@ const VoiceButton = ({ onResult, showToast }: { onResult: (text: string) => void
 
 const LoginScreen = ({ onLogin, showToast }: { onLogin: (user: any) => void, showToast: (msg: string, type?: 'success' | 'error') => void }) => {
   const [isSignUp, setIsSignUp] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const { register, handleSubmit, formState: { isSubmitting }, reset } = useForm();
 
   const onSubmit = async (data: any) => {
     try {
-      const endpoint = isSignUp ? '/api/signup' : '/api/login';
-      const res = await apiFetch(endpoint, {
-        method: 'POST',
-        body: JSON.stringify(data),
-      });
+      if (isSignUp) {
+        const { data: authData, error: authError } = await supabase.auth.signUp({
+          email: data.email,
+          password: data.password,
+          options: { data: { full_name: data.name } }
+        });
 
-      if (res.ok) {
-        if (isSignUp) {
-          const result = await res.json();
-          showToast(result.message || 'Conta criada com sucesso!');
-          setIsSignUp(false);
-          reset();
-        } else {
-          const user = await res.json();
-          onLogin(user);
-          showToast('BEM-VINDO DE VOLTA!');
+        if (authError) throw authError;
+
+        if (authData.user) {
+          const mainEmail = "engemec.gabrielsilva@gmail.com";
+          const role = (data.email === mainEmail || data.email === "admin@proteforms.com") ? "admin" : "tecnico";
+          
+          const { error: profileError } = await supabase.from("profiles").insert({
+            id: authData.user.id,
+            email: data.email,
+            role: role,
+            name: data.name
+          });
+          
+          if (profileError) console.error('Error creating profile:', profileError);
         }
+
+        showToast('Conta criada com sucesso! Verifique seu e-mail se necessário.');
+        setIsSignUp(false);
+        reset();
       } else {
-        const err = await res.json();
-        const message = err.detail ? `${err.error} ${err.detail}` : (err.error || 'Erro ao processar');
-        showToast(message, 'error');
+        const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+          email: data.email,
+          password: data.password
+        });
+
+        if (authError) throw authError;
+
+        const { data: profile, error: profileError } = await supabase
+          .from("profiles")
+          .select("*")
+          .eq("id", authData.user.id)
+          .single();
+
+        if (profileError && profileError.code !== 'PGRST116') throw profileError;
+
+        let finalProfile = profile;
+        if (!profile) {
+          const mainEmail = "engemec.gabrielsilva@gmail.com";
+          const role = (data.email === mainEmail || data.email === "admin@proteforms.com") ? "admin" : "tecnico";
+          const name = authData.user.user_metadata?.full_name || data.email.split("@")[0];
+          
+          const { data: newProfile, error: insertError } = await supabase
+            .from("profiles")
+            .insert({ id: authData.user.id, email: data.email, role, name })
+            .select()
+            .single();
+          
+          if (insertError) throw insertError;
+          finalProfile = newProfile;
+        }
+
+        onLogin(finalProfile);
+        showToast('BEM-VINDO DE VOLTA!');
       }
-    } catch (error) {
-      showToast('Erro de conexão', 'error');
+    } catch (error: any) {
+      console.error('Auth error:', error);
+      showToast(error.message || 'Erro ao processar autenticação', 'error');
     }
   };
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6">
+      {isSubmitting && <LoadingOverlay />}
       <div className="w-full max-w-sm space-y-8">
         <div className="text-center space-y-2">
           <div className="w-20 h-20 bg-brand-blue text-white rounded-3xl flex items-center justify-center mx-auto shadow-xl mb-6">
@@ -284,13 +458,22 @@ const LoginScreen = ({ onLogin, showToast }: { onLogin: (user: any) => void, sho
           </div>
           <div className="space-y-1">
             <label className="text-[10px] font-bold text-slate-500 uppercase ml-1">Senha</label>
-            <input 
-              {...register('password')} 
-              type="password" 
-              placeholder="••••••••" 
-              className="w-full p-4 rounded-xl border border-slate-200 bg-white text-sm focus:ring-2 focus:ring-brand-blue outline-none transition-all" 
-              required 
-            />
+            <div className="relative">
+              <input 
+                {...register('password')} 
+                type={showPassword ? "text" : "password"} 
+                placeholder="••••••••" 
+                className="w-full p-4 pr-12 rounded-xl border border-slate-200 bg-white text-sm focus:ring-2 focus:ring-brand-blue outline-none transition-all" 
+                required 
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 transition-colors"
+              >
+                {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
+              </button>
+            </div>
           </div>
 
           <button 
@@ -332,15 +515,86 @@ const LoginScreen = ({ onLogin, showToast }: { onLogin: (user: any) => void, sho
 const Dashboard = ({ onTabChange, onSelectReport }: { onTabChange: (tab: string) => void, onSelectReport: (id: number) => void }) => {
   const [stats, setStats] = useState<any>(null);
   const [recentReports, setRecentReports] = useState<Report[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    apiFetch('/api/stats').then(res => res.json()).then(data => {
-      if (data && !data.error) setStats(data);
-    });
-    apiFetch('/api/reports').then(res => res.json()).then(data => {
-      if (Array.isArray(data)) setRecentReports(data.slice(0, 5));
-    });
+    // Diagnostic logging for browser capabilities
+    console.log('[System] Checking browser capabilities...');
+    console.log('[System] User Agent:', navigator.userAgent);
+    console.log('[System] HTTPS:', window.location.protocol === 'https:');
+    console.log('[System] MediaDevices support:', !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+    console.log('[System] SpeechRecognition support:', !!((window as any).webkitSpeechRecognition || (window as any).SpeechRecognition));
+    
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      navigator.mediaDevices.enumerateDevices().then(devices => {
+        console.log('[System] Available devices:', devices.length);
+        devices.forEach(d => console.log(` - ${d.kind}: ${d.label || 'unnamed'}`));
+      }).catch(err => console.error('[System] Error enumerating devices:', err));
+    }
+
+    const fetchStats = async () => {
+      try {
+        const { count: totalConstructions } = await supabase.from("constructions").select("*", { count: 'exact', head: true });
+        const { count: totalReports } = await supabase.from("reports").select("*", { count: 'exact', head: true });
+        const { data: statusData } = await supabase.from("constructions").select("status");
+        
+        const statusCounts: any[] = [];
+        const sMap = new Map();
+        statusData?.forEach(s => sMap.set(s.status, (sMap.get(s.status) || 0) + 1));
+        sMap.forEach((count, status) => statusCounts.push({ status, count }));
+
+        setStats({ totalConstructions, totalReports, statusCounts });
+      } catch (err) {
+        console.error('Error fetching stats:', err);
+      }
+    };
+
+    const fetchRecentReports = async () => {
+      try {
+        const { data, error } = await supabase.from("reports").select(`
+          *,
+          constructions:construction_id (name, contract_number)
+        `).order("id", { ascending: false }).limit(5);
+        
+        if (error) throw error;
+        
+        const formatted = data.map((r: any) => ({
+          ...r,
+          construction_name: r.constructions?.name,
+          contract_number: r.constructions?.contract_number
+        }));
+        
+        setRecentReports(formatted);
+      } catch (err) {
+        console.error('Error fetching reports:', err);
+      }
+    };
+
+    const fetchAllData = async () => {
+      try {
+        setLoading(true);
+        await Promise.all([
+          fetchWithTimeout(fetchStats()),
+          fetchWithTimeout(fetchRecentReports())
+        ]);
+      } catch (error) {
+        console.error("Error fetching dashboard data:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchAllData();
   }, []);
+
+  if (loading) {
+    return (
+      <div className="pb-24">
+        <Header title="Proteforms" subtitle="Gestão Técnica de Inspeções" />
+        <LoadingScreen />
+      </div>
+    );
+  }
 
   return (
     <div className="pb-24">
@@ -421,31 +675,58 @@ const Dashboard = ({ onTabChange, onSelectReport }: { onTabChange: (tab: string)
 const ObrasList = ({ onEdit, showToast }: { onEdit: (obra: Construction) => void, showToast: (msg: string, type?: 'success' | 'error') => void }) => {
   const [obras, setObras] = useState<Construction[]>([]);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    apiFetch('/api/constructions').then(res => res.json()).then(data => {
-      if (Array.isArray(data)) setObras(data);
-    });
+    const fetchObras = async () => {
+      try {
+        setLoading(true);
+        const { data, error } = await fetchWithTimeout(supabase.from("constructions").select("*").order("name"));
+        if (error) {
+          console.error('Error fetching constructions:', error);
+        } else if (data) {
+          setObras(data);
+        }
+      } catch (error) {
+        console.error('Error in fetchObras:', error);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchObras();
   }, []);
 
   const handleDelete = async () => {
     if (!deletingId) return;
 
     try {
-      const res = await apiFetch(`/api/constructions/${deletingId}`, { method: 'DELETE' });
-      if (res.ok) {
-        showToast('OBRA EXCLUÍDA COM SUCESSO!');
-        setObras(obras.filter(o => o.id !== deletingId));
-      } else {
-        const err = await res.json();
-        showToast(err.error || 'Erro ao excluir obra', 'error');
+      const { count } = await supabase.from("reports").select("*", { count: 'exact', head: true }).eq("construction_id", deletingId);
+      if (count && count > 0) {
+        showToast("Não é possível excluir uma obra que possui relatórios vinculados.", "error");
+        setDeletingId(null);
+        return;
       }
-    } catch (error) {
-      showToast('Erro de conexão ao excluir obra', 'error');
+
+      const { error } = await supabase.from("constructions").delete().eq("id", deletingId);
+      if (error) throw error;
+
+      showToast('OBRA EXCLUÍDA COM SUCESSO!');
+      setObras(obras.filter(o => o.id !== deletingId));
+    } catch (error: any) {
+      showToast(error.message || 'Erro ao excluir obra', 'error');
     } finally {
       setDeletingId(null);
     }
   };
+
+  if (loading) {
+    return (
+      <div className="pb-24">
+        <Header title="Obras" subtitle="Gerenciamento de Canteiros" />
+        <LoadingScreen />
+      </div>
+    );
+  }
 
   return (
     <div className="pb-24">
@@ -535,20 +816,31 @@ const CreateReportFlow = ({ onCancel, onSuccess, initialData, showToast }: { onC
   const [checklist, setChecklist] = useState<ReportChecklistItem[]>(initialData?.checklist || []);
   const [reportDate, setReportDate] = useState(initialData?.inspection_date || format(new Date(), 'yyyy-MM-dd'));
   const [photoSourceMenuOpen, setPhotoSourceMenuOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    apiFetch('/api/constructions').then(res => res.json()).then(data => {
-      if (Array.isArray(data)) {
-        setObras(data);
-        if (initialData) {
-          const obra = data.find((o: Construction) => o.id === initialData.construction_id);
-          if (obra) setSelectedObra(obra);
+    const fetchData = async () => {
+      try {
+        setLoading(true);
+        const { data: constructionsData } = await supabase.from("constructions").select("*").order("name");
+        if (constructionsData) {
+          setObras(constructionsData);
+          if (initialData) {
+            const obra = constructionsData.find((o: Construction) => o.id === initialData.construction_id);
+            if (obra) setSelectedObra(obra);
+          }
         }
+
+        const { data: templatesData } = await supabase.from("checklist_templates").select("*");
+        if (templatesData) setTemplates(templatesData);
+      } catch (err) {
+        console.error('Error fetching data for report flow:', err);
+      } finally {
+        setLoading(false);
       }
-    });
-    apiFetch('/api/checklist-templates').then(res => res.json()).then(data => {
-      if (Array.isArray(data)) setTemplates(data);
-    });
+    };
+    fetchData();
   }, [initialData]);
 
   const handleSelectTemplate = (template: ChecklistTemplate) => {
@@ -562,54 +854,184 @@ const CreateReportFlow = ({ onCancel, onSuccess, initialData, showToast }: { onC
     setStep(3);
   };
 
-  const handleAddPhoto = (mode: 'camera' | 'gallery') => {
+  const handleAddPhoto = async (mode: 'camera' | 'gallery') => {
+    console.log(`[Camera] Initiating photo capture (mode: ${mode})...`);
+    
+    const isNative = Capacitor.isNativePlatform();
+    console.log(`[System] Platform: ${Capacitor.getPlatform()}, Native: ${isNative}`);
+
+    if (isNative) {
+      try {
+        const image = await CapCamera.getPhoto({
+          quality: 90,
+          allowEditing: false,
+          resultType: CameraResultType.Base64,
+          source: mode === 'camera' ? CameraSource.Camera : CameraSource.Photos,
+          saveToGallery: mode === 'camera'
+        });
+
+        if (image.base64String) {
+          const imageUrl = `data:image/${image.format};base64,${image.base64String}`;
+          setPhotos([...photos, { image_url: imageUrl, caption: '', order_index: photos.length }]);
+          console.log('[Camera] Photo captured via Capacitor.');
+        }
+      } catch (err: any) {
+        console.error('[Camera] Capacitor Camera error:', err);
+        if (err.message !== 'User cancelled photos app') {
+          if (showToast) showToast('Erro ao acessar câmera nativa.', 'error');
+        }
+      }
+      return;
+    }
+
+    // Fallback for web/browser
+    // Diagnostic check for getUserMedia (though we use file input for better compatibility)
+    if (mode === 'camera' && (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)) {
+      console.warn('[Camera] navigator.mediaDevices.getUserMedia is NOT supported in this environment.');
+    }
+
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'image/*';
+    
     if (mode === 'camera') {
+      console.log('[Camera] Setting capture="environment" for camera access.');
       input.setAttribute('capture', 'environment');
     }
+
     input.onchange = (e: any) => {
+      console.log('[Camera] Input change event fired.');
       const file = e.target.files[0];
+      
       if (file) {
+        console.log(`[Camera] File selected: ${file.name} (${file.type}, ${file.size} bytes)`);
         const reader = new FileReader();
         reader.onload = (re: any) => {
+          console.log('[Camera] File read successfully.');
           setPhotos([...photos, { image_url: re.target.result, caption: '', order_index: photos.length }]);
         };
+        reader.onerror = (err) => {
+          console.error('[Camera] Error reading file:', err);
+          if (showToast) showToast('Erro ao ler arquivo da imagem.', 'error');
+        };
         reader.readAsDataURL(file);
+      } else {
+        console.warn('[Camera] No file was selected.');
       }
     };
-    input.click();
+
+    // Add a timeout to check if the input was opened (some WebViews might block it silently)
+    let inputFired = false;
+    input.addEventListener('click', () => {
+      inputFired = true;
+      console.log('[Camera] Input clicked.');
+    });
+
+    try {
+      input.click();
+    } catch (err) {
+      console.error('[Camera] Failed to trigger input click:', err);
+      if (showToast) showToast('Falha ao abrir seletor de arquivos.', 'error');
+    }
   };
 
   const saveReport = async (status: 'em_preenchimento' | 'finalizado') => {
     if (!selectedObra) return;
     
-    const payload = {
-      construction_id: selectedObra.id,
-      inspection_date: reportDate,
-      technical_observations: observations,
-      photos,
-      checklist,
-      status
-    };
+    try {
+      setSaving(true);
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error("Usuário não autenticado");
 
-    const url = initialData ? `/api/reports/${initialData.id}` : '/api/reports';
-    const method = initialData ? 'PUT' : 'POST';
+      // Calculate sequence number for new reports
+      let sequenceNumber = 1;
+      if (!initialData?.id) {
+        const { data: lastReports } = await supabase
+          .from("reports")
+          .select("sequence_number")
+          .eq("construction_id", selectedObra.id)
+          .order("sequence_number", { ascending: false })
+          .limit(1);
+        
+        if (lastReports && lastReports.length > 0) {
+          sequenceNumber = (lastReports[0].sequence_number || 0) + 1;
+        }
+      }
 
-    const res = await apiFetch(url, {
-      method,
-      body: JSON.stringify(payload),
-    });
+      const payload: any = {
+        construction_id: selectedObra.id,
+        inspection_date: reportDate,
+        technical_observations: observations,
+        status: status,
+        created_by: user.id
+      };
 
-    if (res.ok) {
-      showToast('RELATÓRIO SALVO COM SUCESSO!');
+      if (!initialData?.id) {
+        payload.sequence_number = sequenceNumber;
+      }
+
+      let reportId: number;
+
+      if (initialData?.id) {
+        const { error: updateError } = await supabase.from("reports").update(payload).eq("id", initialData.id);
+        if (updateError) throw updateError;
+        reportId = initialData.id;
+
+        // Delete old photos and checklist items
+        await supabase.from("report_photos").delete().eq("report_id", reportId);
+        await supabase.from("report_checklists").delete().eq("report_id", reportId);
+      } else {
+        const { data: newReport, error: insertError } = await supabase.from("reports").insert(payload).select().single();
+        if (insertError) throw insertError;
+        reportId = newReport.id;
+      }
+
+      // Insert photos
+      if (photos.length > 0) {
+        const photosPayload = photos.map((p, i) => ({
+          report_id: reportId,
+          image_url: p.image_url,
+          caption: p.caption || '',
+          order_index: i
+        }));
+        const { error: photosError } = await supabase.from("report_photos").insert(photosPayload);
+        if (photosError) throw photosError;
+      }
+
+      // Insert checklist
+      if (checklist.length > 0) {
+        const checklistPayload = checklist.map(c => ({
+          report_id: reportId,
+          item_name: c.item_name,
+          status: c.status,
+          observation: c.observation || ''
+        }));
+        const { error: checklistError } = await supabase.from("report_checklists").insert(checklistPayload);
+        if (checklistError) throw checklistError;
+      }
+
+      showToast(status === 'finalizado' ? 'RELATÓRIO FINALIZADO COM SUCESSO!' : 'RELATÓRIO SALVO COM SUCESSO!');
       onSuccess();
+    } catch (error: any) {
+      console.error('Error saving report:', error);
+      showToast(error.message || 'Erro ao salvar relatório', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
+  if (loading) {
+    return (
+      <div className="fixed inset-0 bg-slate-50 z-[60]">
+        <Header title="Novo Relatório" showBack onBack={onCancel} />
+        <LoadingScreen />
+      </div>
+    );
+  }
+
   return (
     <div className="fixed inset-0 bg-slate-50 z-[60] overflow-y-auto pb-24">
+      {saving && <LoadingOverlay />}
       <Header 
         title={
           step === 1 ? "Selecionar Obra" : 
@@ -905,6 +1327,8 @@ const CreateReportFlow = ({ onCancel, onSuccess, initialData, showToast }: { onC
 };
 
 const SettingsScreen = ({ showToast }: { showToast: (msg: string, type?: 'success' | 'error') => void }) => {
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [settings, setSettings] = useState<CompanySettings>({
     name: '', cnpj: '', logo: '', technical_responsible: '', email: '', phone: '', default_checklist: '[]',
     resp1_name: '', resp1_reg_name: '', resp1_reg_num: '', resp1_title: '', resp1_signature: '',
@@ -920,67 +1344,87 @@ const SettingsScreen = ({ showToast }: { showToast: (msg: string, type?: 'succes
   const [deletingTemplate, setDeletingTemplate] = useState<any | null>(null);
 
   useEffect(() => {
-    apiFetch('/api/settings').then(res => res.json()).then(data => {
-      if (data && data.id) setSettings(data);
-    });
-    apiFetch('/api/checklist-templates').then(res => res.json()).then(data => {
-      if (Array.isArray(data)) setTemplates(data);
-    });
-    apiFetch('/api/users').then(res => res.json()).then(data => {
-      if (Array.isArray(data)) setUsers(data);
-    });
+    const fetchData = async () => {
+      try {
+        setLoading(true);
+        const [sRes, tRes, uRes] = await Promise.all([
+          fetchWithTimeout(supabase.from("company_settings").select("*").eq("id", 1).single()),
+          fetchWithTimeout(supabase.from("checklist_templates").select("*")),
+          fetchWithTimeout(supabase.from("profiles").select("*"))
+        ]);
+
+        if (sRes.data) setSettings(sRes.data);
+        if (tRes.data) setTemplates(tRes.data);
+        if (uRes.data) setUsers(uRes.data);
+      } catch (err) {
+        console.error('Error fetching settings data:', err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchData();
   }, []);
 
   const handleSaveSettings = async () => {
     try {
-      const res = await apiFetch('/api/settings', {
-        method: 'POST',
-        body: JSON.stringify(settings),
-      });
-      if (res.ok) {
-        showToast('CONFIGURAÇÕES SALVAS COM SUCESSO');
-      } else {
-        showToast('ERRO AO SALVAR CONFIGURAÇÕES', 'error');
-      }
-    } catch (error) {
-      showToast('ERRO DE CONEXÃO', 'error');
+      setSaving(true);
+      const { error } = await supabase.from("company_settings").upsert({ ...settings, id: 1 });
+      if (error) throw error;
+      showToast('CONFIGURAÇÕES SALVAS COM SUCESSO');
+    } catch (error: any) {
+      console.error('Error saving settings:', error);
+      showToast('ERRO AO SALVAR CONFIGURAÇÕES', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
   const handleAddTemplate = async () => {
     if (!newTemplateTitle || newTemplateItems.length === 0) return;
-    const res = await apiFetch('/api/checklist-templates', {
-      method: 'POST',
-      body: JSON.stringify({ title: newTemplateTitle, items: newTemplateItems }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      setTemplates([...templates, { id: data.id, title: newTemplateTitle, items: newTemplateItems }]);
+    try {
+      setSaving(true);
+      const { data, error } = await supabase.from("checklist_templates").insert({ 
+        title: newTemplateTitle, 
+        items: newTemplateItems 
+      }).select().single();
+      
+      if (error) throw error;
+
+      setTemplates([...templates, data]);
       setNewTemplateTitle('');
       setNewTemplateItems([]);
       showToast('MODELO DE CHECKLIST CRIADO COM SUCESSO!');
+    } catch (error: any) {
+      showToast('Erro ao criar modelo', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
   const confirmDeleteTemplate = async () => {
     if (!deletingTemplate) return;
-    const res = await apiFetch(`/api/checklist-templates/${deletingTemplate.id}`, { method: 'DELETE' });
-    if (res.ok) {
+    try {
+      const { error } = await supabase.from("checklist_templates").delete().eq("id", deletingTemplate.id);
+      if (error) throw error;
       setTemplates(templates.filter(t => t.id !== deletingTemplate.id));
       showToast('MODELO EXCLUÍDO');
+    } catch (error: any) {
+      showToast('Erro ao excluir modelo', 'error');
     }
     setDeletingTemplate(null);
   };
 
   const confirmDeleteUser = async () => {
     if (!deletingUser) return;
-    const res = await apiFetch(`/api/users/${deletingUser.id}`, { method: 'DELETE' });
-    if (res.ok) {
+    try {
+      // Note: Deleting from profiles doesn't delete from auth.users automatically
+      // but for this app's logic it might be enough or handled by triggers
+      const { error } = await supabase.from("profiles").delete().eq("id", deletingUser.id);
+      if (error) throw error;
       setUsers(users.filter(u => u.id !== deletingUser.id));
       showToast('USUÁRIO EXCLUÍDO');
-    } else {
-      const err = await res.json();
-      showToast(err.error || 'Erro ao excluir usuário', 'error');
+    } catch (error: any) {
+      showToast(error.message || 'Erro ao excluir usuário', 'error');
     }
     setDeletingUser(null);
   };
@@ -1003,8 +1447,11 @@ const SettingsScreen = ({ showToast }: { showToast: (msg: string, type?: 'succes
     }
   };
 
+  if (loading) return <LoadingScreen />;
+
   return (
     <div className="pb-24">
+      {saving && <LoadingOverlay />}
       <Header title="Configurações" subtitle="Dados da Empresa e Modelos" />
       <div className="p-6 space-y-8">
         <section className="space-y-4">
@@ -1252,31 +1699,62 @@ const SettingsScreen = ({ showToast }: { showToast: (msg: string, type?: 'succes
 const ReportsList = ({ onSelect, showToast }: { onSelect: (report: Report) => void, showToast: (msg: string, type?: 'success' | 'error') => void }) => {
   const [reports, setReports] = useState<Report[]>([]);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    apiFetch('/api/reports').then(res => res.json()).then(data => {
-      if (Array.isArray(data)) setReports(data);
-    });
+    const fetchReports = async () => {
+      try {
+        setLoading(true);
+        const { data, error } = await fetchWithTimeout(supabase.from("reports").select(`
+          *,
+          constructions:construction_id (name, contract_number)
+        `).order("id", { ascending: false }));
+        
+        if (error) throw error;
+        
+        const formatted = data.map((r: any) => ({
+          ...r,
+          construction_name: r.constructions?.name,
+          contract_number: r.constructions?.contract_number
+        }));
+        
+        setReports(formatted);
+      } catch (err) {
+        console.error('Error fetching reports:', err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchReports();
   }, []);
 
   const handleDelete = async () => {
     if (!deletingId) return;
 
     try {
-      const res = await apiFetch(`/api/reports/${deletingId}`, { method: 'DELETE' });
-      if (res.ok) {
-        showToast('RELATÓRIO EXCLUÍDO COM SUCESSO!');
-        setReports(reports.filter(r => r.id !== deletingId));
-      } else {
-        const err = await res.json();
-        showToast(err.error || 'Erro ao excluir relatório', 'error');
-      }
-    } catch (error) {
-      showToast('Erro de conexão ao excluir relatório', 'error');
+      await supabase.from("report_photos").delete().eq("report_id", deletingId);
+      await supabase.from("report_checklists").delete().eq("report_id", deletingId);
+      const { error } = await supabase.from("reports").delete().eq("id", deletingId);
+      
+      if (error) throw error;
+
+      showToast('RELATÓRIO EXCLUÍDO COM SUCESSO!');
+      setReports(reports.filter(r => r.id !== deletingId));
+    } catch (error: any) {
+      showToast(error.message || 'Erro ao excluir relatório', 'error');
     } finally {
       setDeletingId(null);
     }
   };
+
+  if (loading) {
+    return (
+      <div className="pb-24">
+        <Header title="Relatórios" subtitle="Histórico de Inspeções" />
+        <LoadingScreen />
+      </div>
+    );
+  }
 
   return (
     <div className="pb-24">
@@ -1342,37 +1820,56 @@ const ReportDetail = ({ reportId, onBack, onEdit, showToast }: { reportId: numbe
   const [settings, setSettings] = useState<CompanySettings | null>(null);
   const [construction, setConstruction] = useState<Construction | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const loadData = async () => {
-      const rRes = await apiFetch(`/api/reports/${reportId}`);
-      const rData = await rRes.json();
-      setReport(rData);
+      try {
+        setLoading(true);
+        const { data: reportData, error: reportError } = await supabase.from("reports").select(`
+          *,
+          constructions:construction_id (contract_number)
+        `).eq("id", reportId).single();
+        
+        if (reportError || !reportData) throw new Error("Report not found");
+        
+        const { data: photos } = await supabase.from("report_photos").select("*").eq("report_id", reportId).order("order_index");
+        const { data: checklist } = await supabase.from("report_checklists").select("*").eq("report_id", reportId);
+        
+        const fullReport = { 
+          ...reportData, 
+          contract_number: reportData.constructions?.contract_number,
+          photos: photos || [], 
+          checklist: checklist || [] 
+        };
+        setReport(fullReport);
 
-      const sRes = await apiFetch('/api/settings');
-      const sData = await sRes.json();
-      setSettings(sData);
+        const { data: sData } = await supabase.from("company_settings").select("*").eq("id", 1).single();
+        setSettings(sData || {});
 
-      const cRes = await apiFetch('/api/constructions');
-      const cData = await cRes.json();
-      const obra = cData.find((o: Construction) => o.id === rData.construction_id);
-      setConstruction(obra);
+        const { data: cData } = await supabase.from("constructions").select("*").eq("id", reportData.construction_id).single();
+        setConstruction(cData);
+      } catch (err) {
+        console.error('Error loading report detail:', err);
+      } finally {
+        setLoading(false);
+      }
     };
     loadData();
   }, [reportId]);
 
   const handleDelete = async () => {
     try {
-      const res = await apiFetch(`/api/reports/${reportId}`, { method: 'DELETE' });
-      if (res.ok) {
-        showToast('RELATÓRIO EXCLUÍDO COM SUCESSO!');
-        onBack();
-      } else {
-        const err = await res.json();
-        showToast(err.error || 'Erro ao excluir relatório', 'error');
-      }
-    } catch (error) {
-      showToast('Erro de conexão ao excluir relatório', 'error');
+      await supabase.from("report_photos").delete().eq("report_id", reportId);
+      await supabase.from("report_checklists").delete().eq("report_id", reportId);
+      const { error } = await supabase.from("reports").delete().eq("id", reportId);
+      
+      if (error) throw error;
+
+      showToast('RELATÓRIO EXCLUÍDO COM SUCESSO!');
+      onBack();
+    } catch (error: any) {
+      showToast(error.message || 'Erro ao excluir relatório', 'error');
     } finally {
       setShowDeleteConfirm(false);
     }
@@ -1789,7 +2286,16 @@ const ReportDetail = ({ reportId, onBack, onEdit, showToast }: { reportId: numbe
     saveAs(blob, `RTI_${construction.name.replace(/\s/g, '_')}_${report.inspection_date}.docx`);
   };
 
-  if (!report) return <div className="p-12 text-center">Carregando...</div>;
+  if (loading || !report) {
+    return (
+      <div className="fixed inset-0 bg-slate-50 z-[60] flex flex-col">
+        <Header title="Detalhes do Relatório" showBack onBack={onBack} />
+        <div className="flex-1 flex items-center justify-center">
+          <LoadingScreen />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="pb-24 bg-slate-50 min-h-screen">
@@ -1876,30 +2382,30 @@ const ReportDetail = ({ reportId, onBack, onEdit, showToast }: { reportId: numbe
 };
 
 const CreateObra = ({ onCancel, onSuccess, initialData, showToast }: { onCancel: () => void, onSuccess: () => void, initialData?: Construction, showToast: (msg: string, type?: 'success' | 'error') => void }) => {
+  const [saving, setSaving] = useState(false);
   const { register, handleSubmit, setValue, watch } = useForm<Partial<Construction>>({
     defaultValues: initialData || {}
   });
   const photo = watch('photo');
 
   const onSubmit = async (data: any) => {
-    const url = initialData ? `/api/constructions/${initialData.id}` : '/api/constructions';
-    const method = initialData ? 'PUT' : 'POST';
-    
     try {
-      const res = await apiFetch(url, {
-        method,
-        body: JSON.stringify(data),
-      });
-      
-      if (res.ok) {
-        showToast(initialData ? 'OBRA ATUALIZADA COM SUCESSO!' : 'OBRA CADASTRADA COM SUCESSO!');
-        onSuccess();
+      setSaving(true);
+      if (initialData?.id) {
+        const { error } = await supabase.from("constructions").update(data).eq("id", initialData.id);
+        if (error) throw error;
+        showToast('OBRA ATUALIZADA COM SUCESSO!');
       } else {
-        const err = await res.json();
-        showToast(`Erro: ${err.error || 'Falha ao salvar'}`, 'error');
+        const { error } = await supabase.from("constructions").insert(data);
+        if (error) throw error;
+        showToast('OBRA CADASTRADA COM SUCESSO!');
       }
-    } catch (error) {
-      showToast('Erro de conexão com o servidor', 'error');
+      onSuccess();
+    } catch (error: any) {
+      console.error('Error saving construction:', error);
+      showToast(`Erro: ${error.message || 'Falha ao salvar'}`, 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -1914,6 +2420,7 @@ const CreateObra = ({ onCancel, onSuccess, initialData, showToast }: { onCancel:
 
   return (
     <div className="fixed inset-0 bg-slate-50 z-[60] overflow-y-auto pb-24">
+      {saving && <LoadingOverlay />}
       <Header title="Nova Obra" showBack onBack={onCancel} />
       <form onSubmit={handleSubmit(onSubmit)} className="p-6 space-y-4">
         <div 
@@ -1955,25 +2462,51 @@ const CreateObra = ({ onCancel, onSuccess, initialData, showToast }: { onCancel:
 };
 
 const CreateUser = ({ onCancel, onSuccess, showToast }: { onCancel: () => void, onSuccess: () => void, showToast: (msg: string, type?: 'success' | 'error') => void }) => {
+  const [showPassword, setShowPassword] = useState(false);
+  const [saving, setSaving] = useState(false);
   const { register, handleSubmit } = useForm();
 
   const onSubmit = async (data: any) => {
-    const res = await apiFetch('/api/users', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-    
-    if (res.ok) {
+    try {
+      setSaving(true);
+      const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+        email: data.email,
+        password: data.password,
+        options: {
+          data: {
+            name: data.name,
+            role: data.role
+          }
+        }
+      });
+
+      if (signUpError) throw signUpError;
+
+      // Also insert into profiles if not handled by trigger
+      const { error: profileError } = await supabase.from("profiles").insert({
+        id: signUpData.user?.id,
+        name: data.name,
+        email: data.email,
+        role: data.role
+      });
+
+      if (profileError) {
+        console.warn('User signed up but profile creation failed:', profileError);
+      }
+
       showToast('USUÁRIO CADASTRADO COM SUCESSO!');
       onSuccess();
-    } else {
-      const err = await res.json();
-      showToast(`Erro: ${err.error}`, 'error');
+    } catch (error: any) {
+      console.error('Error creating user:', error);
+      showToast(`Erro: ${error.message || 'Falha ao cadastrar'}`, 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
   return (
     <div className="fixed inset-0 bg-slate-50 z-[60] overflow-y-auto pb-24">
+      {saving && <LoadingOverlay />}
       <Header title="Novo Usuário" showBack onBack={onCancel} />
       <form onSubmit={handleSubmit(onSubmit)} className="p-6 space-y-4">
         <div className="space-y-2">
@@ -1986,7 +2519,22 @@ const CreateUser = ({ onCancel, onSuccess, showToast }: { onCancel: () => void, 
         </div>
         <div className="space-y-2">
           <label className="text-xs font-bold text-slate-500 uppercase ml-1">Senha</label>
-          <input {...register('password')} type="password" placeholder="••••••••" className="w-full p-4 rounded-xl border border-slate-200 bg-white text-sm" required />
+          <div className="relative">
+            <input 
+              {...register('password')} 
+              type={showPassword ? "text" : "password"} 
+              placeholder="••••••••" 
+              className="w-full p-4 pr-12 rounded-xl border border-slate-200 bg-white text-sm" 
+              required 
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword(!showPassword)}
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 transition-colors"
+            >
+              {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
+            </button>
+          </div>
         </div>
         <div className="space-y-2">
           <label className="text-xs font-bold text-slate-500 uppercase ml-1">Cargo / Função</label>
@@ -2009,15 +2557,62 @@ const AnalysisScreen = () => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    apiFetch('/api/analytics')
-      .then(res => res.json())
-      .then(data => {
-        if (data && !data.error) setData(data);
+    const fetchAnalytics = async () => {
+      try {
+        const [reportsRes, constructionsRes] = await Promise.all([
+          fetchWithTimeout(supabase.from("reports").select("status, inspection_date")),
+          fetchWithTimeout(supabase.from("constructions").select("status"))
+        ]);
+        
+        const reports = reportsRes.data;
+        const constructions = constructionsRes.data;
+        
+        if (!reports || !constructions) throw new Error("No data");
+
+        // Status de Obras
+        const obrasStatus = constructions.reduce((acc: any, curr: any) => {
+          const status = curr.status === 'em_andamento' ? 'Em Andamento' : 'Concluída';
+          acc[status] = (acc[status] || 0) + 1;
+          return acc;
+        }, {});
+
+        // Status de Relatórios
+        const relatoriosStatus = reports.reduce((acc: any, curr: any) => {
+          const status = curr.status === 'finalizado' ? 'Finalizados' : 'Em Preenchimento';
+          acc[status] = (acc[status] || 0) + 1;
+          return acc;
+        }, {});
+
+        // Relatórios por Mês (últimos 6 meses)
+        const monthlyData: any = {};
+        reports.forEach((r: any) => {
+          const date = parseISO(r.inspection_date);
+          const month = format(date, 'MMM', { locale: ptBR });
+          monthlyData[month] = (monthlyData[month] || 0) + 1;
+        });
+
+        setData({
+          obrasStatus: Object.entries(obrasStatus).map(([name, value]) => ({ name, value })),
+          relatoriosStatus: Object.entries(relatoriosStatus).map(([name, value]) => ({ name, value })),
+          monthly: Object.entries(monthlyData).map(([name, count]) => ({ name, count })).slice(-6)
+        });
+      } catch (err) {
+        console.error('Error fetching analytics:', err);
+      } finally {
         setLoading(false);
-      });
+      }
+    };
+    fetchAnalytics();
   }, []);
 
-  if (loading) return <div className="p-12 text-center text-slate-400">Carregando indicadores...</div>;
+  if (loading) {
+    return (
+      <div className="pb-24">
+        <Header title="Análise" subtitle="Indicadores de Performance" />
+        <LoadingScreen />
+      </div>
+    );
+  }
   if (!data) return <div className="p-12 text-center text-slate-400">Erro ao carregar indicadores.</div>;
 
   const COLORS = ['#0D4E5E', '#14B8A6', '#F59E0B', '#EF4444', '#8B5CF6'];
@@ -2114,7 +2709,7 @@ const AnalysisScreen = () => {
 
 // --- Main App ---
 
-export default function App() {
+function AppContent() {
   const [user, setUser] = useState<any>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -2126,15 +2721,60 @@ export default function App() {
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
 
   useEffect(() => {
-    apiFetch('/api/me')
-      .then(res => {
-        if (res.ok) return res.json();
-        throw new Error('Not logged in');
-      })
-      .then(setUser)
-      .catch(() => setUser(null))
-      .finally(() => setIsAuthReady(true));
+    let subscription: any = null;
+
+    const init = async () => {
+      try {
+        // 1. Check current session
+        const { data: { session } } = await fetchWithTimeout(supabase.auth.getSession(), 5000);
+        if (session?.user) {
+          try {
+            const { data: profile } = await fetchWithTimeout(supabase.from("profiles").select("*").eq("id", session.user.id).single(), 5000);
+            setUser(profile || session.user);
+          } catch (err) {
+            console.error("Error fetching profile:", err);
+            setUser(session.user);
+          }
+        }
+
+        // 2. Listen for auth changes
+        const { data } = supabase.auth.onAuthStateChange(async (event, session) => {
+          if (session?.user) {
+            try {
+              const { data: profile } = await fetchWithTimeout(supabase.from("profiles").select("*").eq("id", session.user.id).single(), 5000);
+              setUser(profile || session.user);
+            } catch (err) {
+              setUser(session.user);
+            }
+          } else {
+            setUser(null);
+          }
+        });
+        subscription = data.subscription;
+      } catch (error) {
+        console.error("Auth initialization error:", error);
+      } finally {
+        setIsAuthReady(true);
+      }
+    };
+
+    init();
+
+    return () => {
+      if (subscription) subscription.unsubscribe();
+    };
   }, []);
+
+  // Safety timeout for initial loading
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!isAuthReady) {
+        console.warn("Auth check timed out, forcing ready state");
+        setIsAuthReady(true);
+      }
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, [isAuthReady]);
 
   const showToast = (message: string, type: 'success' | 'error' = 'success') => {
     setToast({ message, type });
@@ -2142,7 +2782,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    await apiFetch('/api/logout', { method: 'POST' });
+    await supabase.auth.signOut();
     setUser(null);
     setActiveTab('dashboard');
     showToast('SESSÃO ENCERRADA');
@@ -2151,7 +2791,7 @@ export default function App() {
   if (!isAuthReady) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
-        <div className="w-12 h-12 border-4 border-brand-blue border-t-transparent rounded-full animate-spin" />
+        <LoadingScreen />
       </div>
     );
   }
@@ -2348,5 +2988,13 @@ export default function App() {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
   );
 }
