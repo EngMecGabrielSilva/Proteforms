@@ -2560,15 +2560,13 @@ const AnalysisScreen = () => {
     const fetchAnalytics = async () => {
       try {
         const [reportsRes, constructionsRes] = await Promise.all([
-          fetchWithTimeout(supabase.from("reports").select("status, inspection_date")),
+          fetchWithTimeout(supabase.from("reports").select("status, inspection_date, construction_id, constructions:construction_id(name)")),
           fetchWithTimeout(supabase.from("constructions").select("status"))
         ]);
         
-        const reports = reportsRes.data;
-        const constructions = constructionsRes.data;
+        const reports = reportsRes.data || [];
+        const constructions = constructionsRes.data || [];
         
-        if (!reports || !constructions) throw new Error("No data");
-
         // Status de Obras
         const obrasStatus = constructions.reduce((acc: any, curr: any) => {
           const status = curr.status === 'em_andamento' ? 'Em Andamento' : 'Concluída';
@@ -2583,18 +2581,51 @@ const AnalysisScreen = () => {
           return acc;
         }, {});
 
-        // Relatórios por Mês (últimos 6 meses)
+        // Relatórios por Mês
         const monthlyData: any = {};
         reports.forEach((r: any) => {
-          const date = parseISO(r.inspection_date);
-          const month = format(date, 'MMM', { locale: ptBR });
-          monthlyData[month] = (monthlyData[month] || 0) + 1;
+          try {
+            const date = parseISO(r.inspection_date);
+            const monthKey = format(date, 'yyyy-MM');
+            monthlyData[monthKey] = (monthlyData[monthKey] || 0) + 1;
+          } catch (e) {
+            console.error("Error parsing date", r.inspection_date);
+          }
         });
+
+        const reportsByMonth = Object.entries(monthlyData)
+          .sort()
+          .map(([month, count]) => ({ month, count }))
+          .slice(-6);
+
+        // Relatórios por Obra
+        const constructionCounts: any = {};
+        reports.forEach((r: any) => {
+          const name = r.constructions?.name || "Obra Desconhecida";
+          constructionCounts[name] = (constructionCounts[name] || 0) + 1;
+        });
+
+        const reportsByConstruction = Object.entries(constructionCounts).map(([construction, count]) => ({
+          construction,
+          count
+        }));
+
+        // Status Distribution
+        const statusCounts: any = {};
+        reports.forEach((r: any) => {
+          statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;
+        });
+        const statusDistribution = Object.entries(statusCounts).map(([status, count]) => ({
+          status,
+          count
+        }));
 
         setData({
           obrasStatus: Object.entries(obrasStatus).map(([name, value]) => ({ name, value })),
           relatoriosStatus: Object.entries(relatoriosStatus).map(([name, value]) => ({ name, value })),
-          monthly: Object.entries(monthlyData).map(([name, count]) => ({ name, count })).slice(-6)
+          reportsByMonth,
+          reportsByConstruction,
+          statusDistribution
         });
       } catch (err) {
         console.error('Error fetching analytics:', err);
@@ -2661,7 +2692,7 @@ const AnalysisScreen = () => {
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie
-                  data={data.reportsByConstruction}
+                  data={data.reportsByConstruction || []}
                   cx="50%"
                   cy="50%"
                   innerRadius={60}
@@ -2670,7 +2701,7 @@ const AnalysisScreen = () => {
                   dataKey="count"
                   nameKey="construction"
                 >
-                  {data.reportsByConstruction.map((entry: any, index: number) => (
+                  {(data.reportsByConstruction || []).map((entry: any, index: number) => (
                     <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                   ))}
                 </Pie>
@@ -2687,7 +2718,7 @@ const AnalysisScreen = () => {
         <section className="bg-white p-6 rounded-2xl border border-slate-100 shadow-sm">
           <h2 className="text-sm font-bold text-slate-800 mb-6 uppercase tracking-wider">Status dos Relatórios</h2>
           <div className="space-y-4">
-            {data.statusDistribution.map((item: any, idx: number) => (
+            {(data.statusDistribution || []).map((item: any, idx: number) => (
               <div key={idx} className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <div className={cn(
