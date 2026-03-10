@@ -646,7 +646,7 @@ const Dashboard = ({ onTabChange, onSelectReport }: { onTabChange: (tab: string)
                 </div>
                 <div className="flex-1">
                   <p className="text-sm font-bold text-slate-900">
-                    Relatório #{report.contract_number}.{(report.sequence_number || 1).toString().padStart(2, '0')}
+                    Relatório #{report.contract_number}.{(report.id).toString().padStart(2, '0')}
                   </p>
                   <p className="text-xs text-slate-500">
                     {report.construction_name} • {format(parseISO(report.inspection_date), "dd/MM/yy")}
@@ -936,39 +936,21 @@ const CreateReportFlow = ({ onCancel, onSuccess, initialData, showToast }: { onC
   };
 
   const saveReport = async (status: 'em_preenchimento' | 'finalizado') => {
-    if (!selectedObra) return;
+    if (!selectedObra || saving) return;
     
     try {
       setSaving(true);
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("Usuário não autenticado");
 
-      // Calculate sequence number for new reports
-      let sequenceNumber = 1;
-      if (!initialData?.id) {
-        const { data: lastReports } = await supabase
-          .from("reports")
-          .select("sequence_number")
-          .eq("construction_id", selectedObra.id)
-          .order("sequence_number", { ascending: false })
-          .limit(1);
-        
-        if (lastReports && lastReports.length > 0) {
-          sequenceNumber = (lastReports[0].sequence_number || 0) + 1;
-        }
-      }
-
       const payload: any = {
         construction_id: selectedObra.id,
         inspection_date: reportDate,
         technical_observations: observations,
         status: status,
-        created_by: user.id
+        created_by: user.id,
+        revision: initialData?.revision ? initialData.revision + 1 : 1
       };
-
-      if (!initialData?.id) {
-        payload.sequence_number = sequenceNumber;
-      }
 
       let reportId: number;
 
@@ -978,8 +960,20 @@ const CreateReportFlow = ({ onCancel, onSuccess, initialData, showToast }: { onC
         reportId = initialData.id;
 
         // Delete old photos and checklist items
-        await supabase.from("report_photos").delete().eq("report_id", reportId);
-        await supabase.from("report_checklists").delete().eq("report_id", reportId);
+        const { error: delPhotosError } = await supabase.from("report_photos").delete().eq("report_id", reportId);
+        if (delPhotosError) {
+          console.error('Error deleting photos:', delPhotosError);
+          throw delPhotosError;
+        }
+        
+        const { error: delChecklistError } = await supabase.from("report_checklists").delete().eq("report_id", reportId);
+        if (delChecklistError) {
+          console.error('Error deleting checklist:', delChecklistError);
+          throw delChecklistError;
+        }
+
+        // Small delay to ensure DB consistency before re-inserting
+        await new Promise(resolve => setTimeout(resolve, 300));
       } else {
         const { data: newReport, error: insertError } = await supabase.from("reports").insert(payload).select().single();
         if (insertError) throw insertError;
@@ -988,26 +982,44 @@ const CreateReportFlow = ({ onCancel, onSuccess, initialData, showToast }: { onC
 
       // Insert photos
       if (photos.length > 0) {
-        const photosPayload = photos.map((p, i) => ({
+        // Ensure we don't have duplicate photos in the payload to avoid unique constraint issues
+        const uniquePhotos = photos.filter((v, i, a) => 
+          a.findIndex(t => t.image_url === v.image_url) === i
+        );
+
+        const photosPayload = uniquePhotos.map((p, i) => ({
           report_id: reportId,
           image_url: p.image_url,
           caption: p.caption || '',
           order_index: i
         }));
+        
+        console.log('Inserting photos:', photosPayload.length);
         const { error: photosError } = await supabase.from("report_photos").insert(photosPayload);
-        if (photosError) throw photosError;
+        if (photosError) {
+          console.error('Error inserting photos:', photosError);
+          throw photosError;
+        }
       }
 
       // Insert checklist
       if (checklist.length > 0) {
-        const checklistPayload = checklist.map(c => ({
+        // Ensure unique items to avoid potential constraint issues
+        const uniqueChecklist = checklist.filter((v, i, a) => 
+          a.findIndex(t => t.item_name === v.item_name) === i
+        );
+
+        const checklistPayload = uniqueChecklist.map(c => ({
           report_id: reportId,
           item_name: c.item_name,
           status: c.status,
           observation: c.observation || ''
         }));
         const { error: checklistError } = await supabase.from("report_checklists").insert(checklistPayload);
-        if (checklistError) throw checklistError;
+        if (checklistError) {
+          console.error('Error inserting checklist:', checklistError);
+          throw checklistError;
+        }
       }
 
       showToast(status === 'finalizado' ? 'RELATÓRIO FINALIZADO COM SUCESSO!' : 'RELATÓRIO SALVO COM SUCESSO!');
@@ -1308,15 +1320,24 @@ const CreateReportFlow = ({ onCancel, onSuccess, initialData, showToast }: { onC
             <div className="grid grid-cols-2 gap-3 pt-4">
               <button 
                 onClick={() => saveReport('em_preenchimento')}
-                className="py-4 bg-slate-200 text-slate-700 rounded-xl font-bold text-sm"
+                disabled={saving}
+                className={cn(
+                  "py-4 rounded-xl font-bold text-sm transition-colors",
+                  saving ? "bg-slate-100 text-slate-400 cursor-not-allowed" : "bg-slate-200 text-slate-700 hover:bg-slate-300"
+                )}
               >
-                SALVAR RASCUNHO
+                {saving ? 'SALVANDO...' : 'SALVAR RASCUNHO'}
               </button>
               <button 
                 onClick={() => saveReport('finalizado')}
-                className="py-4 bg-brand-teal text-white rounded-xl font-bold text-sm"
+                disabled={saving}
+                className={cn(
+                  "py-4 rounded-xl font-bold text-sm transition-colors",
+                  saving ? "bg-slate-100 text-slate-400 cursor-not-allowed" : "bg-brand-teal/50 text-white cursor-not-allowed"
+                )}
+                style={!saving ? { backgroundColor: '#0D4E5E' } : {}}
               >
-                FINALIZAR
+                {saving ? 'PROCESSANDO...' : 'FINALIZAR'}
               </button>
             </div>
           </div>
@@ -1675,6 +1696,35 @@ const SettingsScreen = ({ showToast }: { showToast: (msg: string, type?: 'succes
             ))}
           </div>
         </section>
+
+        {/* Android Support Section */}
+        <section className="space-y-4">
+          <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wider">Suporte Android</h2>
+          <div className="bg-white p-4 rounded-2xl border border-slate-200 space-y-4">
+            <p className="text-xs text-slate-500">
+              Se a câmera ou o microfone não estiverem funcionando, clique no botão abaixo para solicitar as permissões manualmente.
+            </p>
+            <button 
+              onClick={async () => {
+                try {
+                  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+                    stream.getTracks().forEach(track => track.stop());
+                    showToast("Permissões solicitadas com sucesso!");
+                  } else {
+                    showToast("Seu navegador não suporta esta função.", "error");
+                  }
+                } catch (err) {
+                  showToast("Permissão negada ou erro ao solicitar.", "error");
+                }
+              }}
+              className="w-full py-3 bg-slate-800 text-white rounded-xl font-bold text-xs flex items-center justify-center gap-2"
+            >
+              <Camera size={16} />
+              SOLICITAR PERMISSÕES
+            </button>
+          </div>
+        </section>
       </div>
 
       <ConfirmationModal 
@@ -1774,7 +1824,7 @@ const ReportsList = ({ onSelect, showToast }: { onSelect: (report: Report) => vo
               </div>
               <div className="flex-1">
                 <p className="font-bold text-slate-900">
-                  {report.contract_number ? `${report.contract_number}.${(report.sequence_number || 1).toString().padStart(2, '0')}` : `#${report.id}`} - RTI_{report.construction_name?.substring(0, 5).toUpperCase()}
+                  {report.contract_number ? `${report.contract_number}.${(report.id).toString().padStart(2, '0')}` : `#${report.id}`} - RTI_{report.construction_name?.substring(0, 5).toUpperCase()}
                 </p>
                 <p className="text-xs text-slate-500">{report.construction_name} • {format(parseISO(report.inspection_date), 'dd/MM/yyyy')}</p>
               </div>
@@ -1860,8 +1910,12 @@ const ReportDetail = ({ reportId, onBack, onEdit, showToast }: { reportId: numbe
 
   const handleDelete = async () => {
     try {
-      await supabase.from("report_photos").delete().eq("report_id", reportId);
-      await supabase.from("report_checklists").delete().eq("report_id", reportId);
+      const { error: pError } = await supabase.from("report_photos").delete().eq("report_id", reportId);
+      if (pError) console.error('Error deleting report photos:', pError);
+      
+      const { error: cError } = await supabase.from("report_checklists").delete().eq("report_id", reportId);
+      if (cError) console.error('Error deleting report checklists:', cError);
+
       const { error } = await supabase.from("reports").delete().eq("id", reportId);
       
       if (error) throw error;
@@ -1901,7 +1955,7 @@ const ReportDetail = ({ reportId, onBack, onEdit, showToast }: { reportId: numbe
     doc.setTextColor(13, 78, 94);
     doc.text("Relatório de Inspeção", pageWidth / 2, 145, { align: 'center' });
     
-    const reportNum = `${construction.contract_number}.${(report.sequence_number || 1).toString().padStart(2, '0')}`;
+    const reportNum = `${construction.contract_number}.${(report.id).toString().padStart(2, '0')}`;
     doc.setFontSize(16);
     doc.setTextColor(0);
     doc.setFont("helvetica", "normal");
@@ -2141,7 +2195,7 @@ const ReportDetail = ({ reportId, onBack, onEdit, showToast }: { reportId: numbe
       }
     }
 
-    const reportNum = `${construction.contract_number}.${(report.sequence_number || 1).toString().padStart(2, '0')}`;
+    const reportNum = `${construction.contract_number}.${(report.id).toString().padStart(2, '0')}`;
     const logoImg = settings.logo ? await fetch(settings.logo).then(r => r.arrayBuffer()) : null;
     const sig1Img = settings.resp1_signature ? await fetch(settings.resp1_signature).then(r => r.arrayBuffer()) : null;
     const sig2Img = settings.resp2_signature ? await fetch(settings.resp2_signature).then(r => r.arrayBuffer()) : null;
@@ -2306,7 +2360,7 @@ const ReportDetail = ({ reportId, onBack, onEdit, showToast }: { reportId: numbe
             <div>
               <h2 className="text-lg font-bold text-slate-900">{construction?.name}</h2>
               <p className="text-xs font-bold text-brand-teal mb-1">
-                Nº {construction?.contract_number}.{(report.sequence_number || 1).toString().padStart(2, '0')}
+                Nº {construction?.contract_number}.{(report.id).toString().padStart(2, '0')}
               </p>
               <p className="text-sm text-slate-500">{format(parseISO(report.inspection_date), "dd 'de' MMMM 'de' yyyy", { locale: ptBR })}</p>
             </div>
@@ -2564,18 +2618,18 @@ const AnalysisScreen = () => {
           fetchWithTimeout(supabase.from("constructions").select("status"))
         ]);
         
-        const reports = reportsRes.data || [];
-        const constructions = constructionsRes.data || [];
+        const reports = reportsRes?.data || [];
+        const constructions = constructionsRes?.data || [];
         
         // Status de Obras
-        const obrasStatus = constructions.reduce((acc: any, curr: any) => {
+        const obrasStatus = (constructions || []).reduce((acc: any, curr: any) => {
           const status = curr.status === 'em_andamento' ? 'Em Andamento' : 'Concluída';
           acc[status] = (acc[status] || 0) + 1;
           return acc;
         }, {});
 
         // Status de Relatórios
-        const relatoriosStatus = reports.reduce((acc: any, curr: any) => {
+        const relatoriosStatus = (reports || []).reduce((acc: any, curr: any) => {
           const status = curr.status === 'finalizado' ? 'Finalizados' : 'Em Preenchimento';
           acc[status] = (acc[status] || 0) + 1;
           return acc;
@@ -2583,11 +2637,13 @@ const AnalysisScreen = () => {
 
         // Relatórios por Mês
         const monthlyData: any = {};
-        reports.forEach((r: any) => {
+        (reports || []).forEach((r: any) => {
           try {
-            const date = parseISO(r.inspection_date);
-            const monthKey = format(date, 'yyyy-MM');
-            monthlyData[monthKey] = (monthlyData[monthKey] || 0) + 1;
+            if (r.inspection_date) {
+              const date = parseISO(r.inspection_date);
+              const monthKey = format(date, 'yyyy-MM');
+              monthlyData[monthKey] = (monthlyData[monthKey] || 0) + 1;
+            }
           } catch (e) {
             console.error("Error parsing date", r.inspection_date);
           }
@@ -2600,7 +2656,7 @@ const AnalysisScreen = () => {
 
         // Relatórios por Obra
         const constructionCounts: any = {};
-        reports.forEach((r: any) => {
+        (reports || []).forEach((r: any) => {
           const name = r.constructions?.name || "Obra Desconhecida";
           constructionCounts[name] = (constructionCounts[name] || 0) + 1;
         });
@@ -2612,7 +2668,7 @@ const AnalysisScreen = () => {
 
         // Status Distribution
         const statusCounts: any = {};
-        reports.forEach((r: any) => {
+        (reports || []).forEach((r: any) => {
           statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;
         });
         const statusDistribution = Object.entries(statusCounts).map(([status, count]) => ({
@@ -2752,6 +2808,20 @@ function AppContent() {
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
 
   useEffect(() => {
+    // Request permissions on load for Android webview
+    const requestPermissions = async () => {
+      try {
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+          // Stop stream immediately, we just want to trigger the permission prompt
+          stream.getTracks().forEach(track => track.stop());
+        }
+      } catch (err) {
+        console.warn("Permission request failed or denied:", err);
+      }
+    };
+    requestPermissions();
+
     let subscription: any = null;
 
     const init = async () => {
@@ -2816,6 +2886,9 @@ function AppContent() {
     await supabase.auth.signOut();
     setUser(null);
     setActiveTab('dashboard');
+    setEditingReport(null);
+    setEditingObra(null);
+    setSelectedReportId(null);
     showToast('SESSÃO ENCERRADA');
   };
 

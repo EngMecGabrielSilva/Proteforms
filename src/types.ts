@@ -82,7 +82,6 @@ export interface Report {
   construction_id: number;
   construction_name?: string;
   contract_number?: string;
-  sequence_number?: number;
   inspection_date: string;
   technical_observations: string;
   status: 'em_preenchimento' | 'finalizado';
